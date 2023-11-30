@@ -1,0 +1,183 @@
+# Copyright (c) 2020 Mobvoi Inc. (authors: Binbin Zhang, Xiaoyu Chen, Di Wu)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import print_function
+
+import argparse
+import copy
+import logging
+import os
+import sys
+
+import torch
+import yaml
+from torch.utils.data import DataLoader
+
+from wenet.dataset.dataset import AudioDataset, CollateFunc
+from wenet.transformer.asr_model import init_asr_model
+from wenet.utils.checkpoint import load_checkpoint
+from wenet.auxilary import *
+
+def apply_dropout(m):
+    if type(m) == torch.nn.Dropout:
+        m.eval()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='recognize with your model')
+    parser.add_argument('--config', default='/media/DATA/stl/wenet/examples/librispeech/mini/exp/sp_spec_aug_identity_full/train.yaml', help='config file')
+    parser.add_argument('--checkpoint', default='/media/DATA/stl/wenet/examples/librispeech/mini/exp/sp_spec_aug_identity_full/avg_30.pt', help='checkpoint model')
+    # parser.add_argument('--config', default='/media/DATA/stl/wenet/examples/librispeech/full_model/exp/sp_spec_aug/train.yaml', help='config file')
+    # parser.add_argument('--checkpoint', default='/media/DATA/stl/wenet/examples/librispeech/full_model/exp/sp_spec_aug/avg_30.pt', help='checkpoint model')
+    parser.add_argument('--test_data', default='/media/DATA/stl/wenet/examples/librispeech/full_model/data/test_clean/format.data', help='test data file')
+    parser.add_argument('--gpu',
+                        type=int,
+                        default=-1,
+                        help='gpu id for this rank, -1 for cpu')
+    parser.add_argument('--dict', default='/media/DATA/stl/wenet/examples/librispeech/full_model/data/lang_char/train_960_unigram5000_units.txt', help='dict file')
+    parser.add_argument('--beam_size',
+                        type=int,
+                        default=10,
+                        help='beam size for search')
+    parser.add_argument('--penalty',
+                        type=float,
+                        default=0.0,
+                        help='length penalty')
+    parser.add_argument('--result_file', default='/media/DATA/stl/wenet/examples/librispeech/full_model/exp/words_in_paper/', help='asr result file')
+    parser.add_argument('--batch_size',
+                        type=int,
+                        default=1,
+                        help='asr result file')
+    parser.add_argument('--mode',
+                        choices=[
+                            'attention', 'ctc_greedy_search',
+                            'ctc_prefix_beam_search', 'attention_rescoring'
+                        ],
+                        default='ctc_greedy_search',
+                        help='decoding mode')
+    parser.add_argument('--ctc_weight',
+                        type=float,
+                        default=1,
+                        help='ctc weight for attention rescoring decode mode')
+    parser.add_argument('--decoding_chunk_size',
+                        type=int,
+                        default=-1,
+                        help='''decoding chunk size,
+                                <0: for decoding, use full chunk.
+                                >0: for decoding, use fixed chunk size as set.
+                                0: used for training, it's prohibited here''')
+    parser.add_argument('--num_decoding_left_chunks',
+                        type=int,
+                        default=-1,
+                        help='number of left chunks for decoding')
+    parser.add_argument('--simulate_streaming',
+                        action='store_true',
+                        help='simulate streaming inference')
+    parser.add_argument('--reverse_weight',
+                        type=float,
+                        default=0.0,
+                        help='''right to left weight for attention rescoring
+                                decode mode''')
+    parser.add_argument('--modality', default='AO', help='AO, VO or AV')
+    parser.add_argument('--word', required=False, default=[1189, 2653, 522, 4442, 
+        4958, 2100, 2101, 401, 1173, 385, 2021, 4532, 586, 3553, 3043, 3044, 4520, 
+        964, 3758, 400, 4437, 2055, 2033, 4936, 1733, 1763])
+    # parser.add_argument('--word', required=False, default=[3879, 3885, 1634, 1641, 2034])
+    # parser.add_argument('--word', required=False, default=[3828, 4895, 607])
+    args = parser.parse_args()
+    print(args)
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s %(levelname)s %(message)s')
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+
+    if args.mode in ['ctc_prefix_beam_search', 'attention_rescoring'
+                     ] and args.batch_size > 1:
+        logging.fatal(
+            'decoding mode {} must be running with batch_size == 1'.format(
+                args.mode))
+        sys.exit(1)
+
+    with open(args.config, 'r') as fin:
+        configs = yaml.load(fin, Loader=yaml.FullLoader)
+
+    raw_wav = configs['raw_wav']
+    # Init dataset and data loader
+    test_collate_conf = copy.deepcopy(configs['collate_conf'])
+    test_collate_conf['spec_aug'] = False
+    test_collate_conf['spec_sub'] = False
+    test_collate_conf['feature_dither'] = False
+    test_collate_conf['speed_perturb'] = False
+    if raw_wav:
+        test_collate_conf['wav_distortion_conf']['wav_distortion_rate'] = 0
+        test_collate_conf['wav_distortion_conf']['wav_dither'] = 0.0
+    test_collate_func = CollateFunc(**test_collate_conf, raw_wav=raw_wav)
+    dataset_conf = configs.get('dataset_conf', {})
+    dataset_conf['batch_size'] = args.batch_size
+    dataset_conf['batch_type'] = 'static'
+    dataset_conf['sort'] = False
+    test_dataset = AudioDataset(args.test_data,
+                                **dataset_conf,
+                                raw_wav=raw_wav)
+    test_data_loader = DataLoader(test_dataset,
+                                  collate_fn=test_collate_func,
+                                  shuffle=False,
+                                  batch_size=1,
+                                  num_workers=0)
+
+    # Init asr model from configs
+    model = init_asr_model(configs)
+
+    # Load dict
+    char_dict = {}
+    with open(args.dict, 'r') as fin:
+        for line in fin:
+            arr = line.strip().split()
+            assert len(arr) == 2
+            char_dict[int(arr[1])] = arr[0]
+    eos = len(char_dict) - 1
+
+    load_checkpoint(model, args.checkpoint)
+    # print(model.state_dict()[0])
+    # exit()
+    # model.load_lm()
+    use_cuda = args.gpu >= 0 and torch.cuda.is_available()
+    device = torch.device('cuda' if use_cuda else 'cpu')
+
+    model = model.to(device)
+
+    # model.eval()
+    model.train()
+    model.apply(apply_dropout)
+    
+    for batch_idx, batch in enumerate(test_data_loader):
+        keys, feats, target, feats_lengths, target_lengths = batch
+        # if keys[0] not in ['121-127105-0029', '237-134500-0023', '8463-287645-0009', '1188-133604-0000',
+        # '61-70970-0021', '4970-29095-0018', '1995-1837-0021', '1320-122617-0038']:
+        if keys[0] not in ['1320-122617-0038']:
+            continue
+        feats = feats.to(device)#.requires_grad_(True)
+        target = target.to(device)
+        feats_lengths = feats_lengths.to(device)
+        target_lengths = target_lengths.to(device)
+        hyps, ctc_probs, predIdx = model.ctc_greedy_search_with_prob(
+            feats,
+            feats_lengths,
+            decoding_chunk_size=args.decoding_chunk_size,
+            num_decoding_left_chunks=args.num_decoding_left_chunks,
+            simulate_streaming=args.simulate_streaming)
+        
+        # loss, loss_att, loss_ctc = model(feats, feats_lengths,
+                                            # target, target_lengths)
+        # (-loss).backward()
+        interpret_by_word(model, ctc_probs, predIdx, char_dict, data=(keys, feats, feats_lengths, target, target_lengths), tgtWord=args.word, base_folder=args.result_file)
+        print(hyps)
