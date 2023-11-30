@@ -1,3 +1,10 @@
+This project is developed based on an old version of WeNet.
+All you need in our paper, Grad-SAS, can be found in: 
+* wenet/auxiliary.py (visualization)
+* wenet/transformer/attention.py (hook functions)
+
+No need to run the wenet code, unless you want to train or inference on some audio datasets.
+
 # WeNet
 
 [**中文版**](https://github.com/wenet-e2e/wenet/blob/main/README_CN.md)
